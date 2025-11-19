@@ -16,7 +16,9 @@
 Utility functions for data loading and training of VGSL networks.
 """
 import io
+import gc
 import torch
+import ctypes
 import torch.nn.functional as F
 import numpy as np
 import lightning.pytorch as L
@@ -29,19 +31,22 @@ from itertools import islice
 
 from torch.distributed import get_rank, get_world_size, is_initialized
 
-from typing import (TYPE_CHECKING, Any, Callable, List, Literal, Optional,
-                    Tuple, Union, Sequence)
+from typing import (TYPE_CHECKING, Any, Callable, Literal, Optional, Union,
+                    Sequence)
 
+from itertools import chain
 from functools import partial
 from torchvision.transforms import v2
-from torch.utils.data import Dataset, DataLoader, IterableDataset, get_worker_info
-
+from torch.utils.data import (Dataset, DataLoader, IterableDataset,
+                              get_worker_info, RandomSampler,
+                              WeightedRandomSampler)
 
 from PIL import Image
 
 from scipy.special import comb
 
 from party.tokenizer import OctetTokenizer, LANG_TO_ISO
+
 
 if TYPE_CHECKING:
     from os import PathLike
@@ -111,7 +116,7 @@ def _to_bbox(boundary, im_size):
     return pa.scalar(bbox, type=pa.list_(pa.float32()))
 
 
-def compile(files: Optional[List[Union[str, 'PathLike']]] = None,
+def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
             output_file: Union[str, 'PathLike'] = None,
             normalize_whitespace: bool = True,
             normalization: Optional[Literal['NFD', 'NFC', 'NFKD', 'NFKC']] = None,
@@ -121,7 +126,7 @@ def compile(files: Optional[List[Union[str, 'PathLike']]] = None,
     Compiles a collection of XML facsimile files into a binary arrow dataset.
 
     Args:
-        files: List of XML files
+        files: list of XML files
         output_file: destination to write arrow file to
         normalize_whitespace: whether to normalize all whitespace to ' '
         normalization: Unicode normalization to apply to data.
@@ -131,7 +136,7 @@ def compile(files: Optional[List[Union[str, 'PathLike']]] = None,
     from kraken.lib import functional_im_transforms as F_t
     from kraken.lib.xml import XMLPage
 
-    text_transforms: List[Callable[[str], str]] = []
+    text_transforms: list[Callable[[str], str]] = []
 
     # pyarrow structs
     line_struct = pa.struct([('text', pa.string()),
@@ -243,7 +248,7 @@ def collate_null(batch):
     return batch[0]
 
 
-def collate_sequences(im, page_data, max_seq_len: int):
+def collate_sequences(im, page_data, max_seq_len: int, index: int):
     """
     Sorts and pads image data.
     """
@@ -257,23 +262,35 @@ def collate_sequences(im, page_data, max_seq_len: int):
         curves = torch.stack([x for _, x, _ in page_data])
     if page_data[0][2] is not None:
         boxes = torch.stack([x for _, _, x in page_data])
+    gc.collect()
+    libc = ctypes.CDLL("libc.so.6")
+    libc.malloc_trim(0)
+    gc.collect()
     return {'image': im,
             'tokens': labels,
             'curves': curves,
-            'boxes': boxes}
+            'boxes': boxes,
+            'index': index}
 
 
 class TextLineDataModule(L.LightningDataModule):
     def __init__(self,
-                 training_data: List[Union[str, 'PathLike']],
-                 evaluation_data: List[Union[str, 'PathLike']],
+                 training_data: list[Union[str, 'PathLike']],
+                 evaluation_data: list[Union[str, 'PathLike']],
                  prompt_mode: Literal['boxes', 'curves', 'both'] = 'both',
                  augmentation: bool = False,
                  batch_size: int = 16,
-                 num_workers: int = 8):
+                 val_batch_size: Optional[int] = None,
+                 num_workers: int = 8,
+                 sampling_weights: Optional[list[float]] = None,
+                 **kwargs):
         super().__init__()
 
+        if sampling_weights is not None and len(sampling_weights) != len(sampling_weights):
+            raise ValueError('Per-file sampling weights need to be same length as training_data.')
+
         self.save_hyperparameters()
+        self.hparams.val_batch_size = batch_size if not val_batch_size else val_batch_size
 
         self.im_transforms = get_default_transforms()
 
@@ -296,14 +313,27 @@ class TextLineDataModule(L.LightningDataModule):
                                                batch_size=self.hparams.batch_size)
         self.val_set = ValidationBaselineDataset(self.hparams.evaluation_data,
                                                  im_transforms=self.im_transforms,
-                                                 augmentation=self.hparams.augmentation)
+                                                 augmentation=self.hparams.augmentation,
+                                                 batch_size=self.hparams.val_batch_size)
         self.train_set.max_seq_len = max(self.train_set.max_seq_len, self.val_set.max_seq_len)
         self.val_set.max_seq_len = self.train_set.max_seq_len
 
     def train_dataloader(self):
+        world_size = get_world_size() if is_initialized() else 1
+        if self.hparams.sampling_weights:
+            weights = list(chain(*[(weight,) * ppf for weight, ppf in zip(self.train_set.pages_per_file, self.hparams.sampling_weights)]))
+            sampler = WeightedRandomSampler(weights,
+                                            replacement=True,
+                                            num_samples=self.train_set.num_batches // world_size)
+        else:
+            sampler = RandomSampler(self.train_set,
+                                    replacement=True,
+                                    num_samples=self.train_set.num_batches // world_size)
+
         return DataLoader(self.train_set,
-                          batch_size=1,
                           num_workers=self.hparams.num_workers,
+                          batch_size=1,
+                          sampler=sampler,
                           pin_memory=True,
                           shuffle=False,
                           collate_fn=collate_null)
@@ -322,8 +352,15 @@ class BinnedBaselineDataset(Dataset):
     """
     Dataset for training a line recognition model from baseline data.
 
-    Images are binned, so the batch_size parameter of the data loader is an
-    upper limit of the number of samples returned.
+    Images are binned, i.e. a sample return `batch_size` lines sampled with
+    replacement from a single page at index `n` of the dataset. As lines are
+    sampled with replacement it is not useful to set batch sizes above the
+    average number of lines contained on a page.
+
+    The length of the dataset is the number of pages contained in the source
+    files. A property `num_batches` contains the number of random samples
+    required to roughly sample each line once over an epoch (under the
+    assumption that each page contains the same number of lines).
 
     Args:
         im_transforms: Function taking an PIL.Image and returning a tensor
@@ -353,6 +390,7 @@ class BinnedBaselineDataset(Dataset):
         self.tokenizer = OctetTokenizer()
 
         self.arrow_table = None
+        self.pages_per_file = []
 
         for file in files:
             with pa.memory_map(file, 'rb') as source:
@@ -364,6 +402,7 @@ class BinnedBaselineDataset(Dataset):
                     self.arrow_table = ds_table
                 else:
                     self.arrow_table = pa.concat_tables([self.arrow_table, ds_table])
+                self.pages_per_file.append(len(ds_table))
                 self._len += int.from_bytes(raw_metadata[b'num_lines'], 'little')
                 self.max_seq_len = max(int.from_bytes(raw_metadata[b'max_octets_in_line'], 'little'), self.max_seq_len)
 
@@ -371,12 +410,8 @@ class BinnedBaselineDataset(Dataset):
             from party.augmentation import DefaultAugmenter
             self.aug = DefaultAugmenter()
 
-    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # just sample from a random page
-        rng = np.random.default_rng()
-        idx = rng.integers(0, len(self.arrow_table))
-
-        item = self.arrow_table.column('pages')[idx].as_py()
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        item = self.arrow_table.column('pages')[index].as_py()
         logger.debug(f'Attempting to load {item["im"]}')
         im, lang, page_data = item['im'], item['lang'], item['lines']
         try:
@@ -393,6 +428,7 @@ class BinnedBaselineDataset(Dataset):
         # sample randomly between baselines
         sample = []
         if self.prompt_mode == 'both':
+            rng = np.random.default_rng()
             return_boxes = rng.choice([False, True], 1)
         elif self.prompt_mode == 'boxes':
             return_boxes = True
@@ -404,9 +440,16 @@ class BinnedBaselineDataset(Dataset):
             curve = torch.tensor(line['curve']).view(4, 2) if not return_boxes else None
             bbox = torch.tensor(line['bbox']).view(4, 2) if return_boxes else None
             sample.append((tokens, curve, bbox))
-        return collate_sequences(im.unsqueeze(0), sample, self.max_seq_len)
+        return collate_sequences(im.unsqueeze(0), sample, self.max_seq_len, index)
 
     def __len__(self) -> int:
+        return len(self.arrow_table)
+
+    @property
+    def num_batches(self):
+        """
+        Number of batches in the dataset.
+        """
         return self._len // self.batch_size
 
 
@@ -466,8 +509,10 @@ class ValidationBaselineDataset(IterableDataset):
         num_replicas = num_workers * world_size
         replica_rank = worker_rank * world_size + device_rank
 
-        for item in self.arrow_table.column('pages')[replica_rank::num_replicas]:
-            item = item.as_py()
+        len_ds = self.arrow_table.column('pages').length()
+
+        for idx in range(replica_rank, len_ds, num_replicas):
+            item = self.arrow_table.column('pages')[idx].as_py()
             logger.debug(f'Attempting to load {item["im"]}')
             im, lang, page_data = item['im'], item['lang'], item['lines']
             im = Image.open(io.BytesIO(im)).convert('RGB')
@@ -545,7 +590,7 @@ class TestBaselineDataset(Dataset):
     def __len__(self):
         return len(self.arrow_table)
 
-    def __getitem__(self, index: int) -> Tuple[Image.Image, 'Segmentation']:
+    def __getitem__(self, index: int) -> tuple[Image.Image, 'Segmentation']:
         from kraken.containers import Segmentation, BaselineLine, BBoxLine
 
         item = self.arrow_table.column('pages')[index].as_py()

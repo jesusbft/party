@@ -15,8 +15,6 @@
 """
 Training loop interception helpers
 """
-
-import timm
 import torch
 import logging
 import lightning.pytorch as L
@@ -25,12 +23,13 @@ from torch import nn
 from lightning.pytorch.callbacks import EarlyStopping
 from torch.optim import lr_scheduler
 
-from typing import Literal, Tuple
+from typing import Literal
 
 from torchmetrics.aggregation import MeanMetric
 
 from party.fusion import bytellama_vision_decoder, PartyModel
 
+import timm
 logger = logging.getLogger(__name__)
 
 
@@ -70,14 +69,15 @@ class RecognitionModel(L.LightningModule):
                  schedule: Literal['cosine', 'exponential', 'step', 'reduceonplateau', 'constant'] = 'cosine',
                  step_size: int = 10,
                  gamma: float = 0.1,
-                 rop_factor: float = 0.1,
-                 rop_patience: int = 5,
-                 cos_t_max: float = 30,
+                 sched_factor: float = 0.1,
+                 sched_patience: int = 5,
+                 cos_max: float = 30,
                  cos_min_lr: float = 1e-4,
                  warmup: int = 15000,
-                 encoder: str = 'swin_base_patch4_window12_384.ms_in22k',
-                 encoder_input_size: Tuple[int, int] = (2560, 1920),
-                 decoder: str = 'mittagessen/bytellama_oscar',
+                 encoder: str = 'convnextv2_base.fcmae_ft_in22k_in1k',
+                 encoder_input_size: tuple[int, int] = (2560, 1920),
+                 encoder_idxs: list[int] = (2,),
+                 decoder: str = 'mittagessen/bytellama-40m-oscar',
                  pretrained: bool = True,
                  freeze_encoder: bool = False,
                  batch_size: int = 16,
@@ -89,25 +89,19 @@ class RecognitionModel(L.LightningModule):
         self.best_model = None
 
         self.save_hyperparameters()
+        backbone = timm.create_model(encoder,
+                                     pretrained=pretrained,
+                                     features_only=True,
+                                     out_indices=encoder_idxs)
 
-        # enable fused attn in encoder
-        timm.layers.use_fused_attn(experimental=True)
-
-        encoder_model = timm.create_model(encoder,
-                                          pretrained=pretrained,
-                                          num_classes=0,
-                                          img_size=encoder_input_size,
-                                          global_pool='')
-
-        l_idx = encoder_model.prune_intermediate_layers(indices=(-2,), prune_head=True, prune_norm=True)[0]
-        l_red = encoder_model.feature_info[l_idx]['reduction']
+        encoder_max_seq_len = sum((encoder_input_size[0]//red * encoder_input_size[1] // red) for red in backbone.feature_info.reduction())
 
         decoder_model = bytellama_vision_decoder(pretrained=decoder if pretrained else None,
-                                                 encoder_max_seq_len=encoder_input_size[0] // l_red * encoder_input_size[1] // l_red)
+                                                 encoder_max_seq_len=encoder_max_seq_len)
 
-        self.model = PartyModel(encoder=encoder_model,
+        self.model = PartyModel(encoder=backbone,
                                 decoder=decoder_model,
-                                encoder_embed_dim=encoder_model.feature_info[l_idx]['num_chs'],
+                                encoder_embed_dim=backbone.feature_info.channels()[0],
                                 decoder_embed_dim=decoder_model.tok_embeddings.embedding_dim)
 
         if freeze_encoder:
@@ -268,14 +262,26 @@ def _configure_optimizer_and_lr_scheduler(hparams, model, loss_tracking_mode='mi
     weight_decay = hparams.get("weight_decay")
     schedule = hparams.get("schedule")
     gamma = hparams.get("gamma")
-    cos_t_max = hparams.get("cos_t_max")
+    cos_max = hparams.get("cos_max")
     cos_min_lr = hparams.get("cos_min_lr")
     step_size = hparams.get("step_size")
-    rop_factor = hparams.get("rop_factor")
-    rop_patience = hparams.get("rop_patience")
-    completed_epochs = hparams.get("completed_epochs")
+    sched_factor = hparams.get("sched_factor")
+    sched_patience = hparams.get("sched_patience")
+    completed_epochs = hparams.get("completed_epochs", 0)
 
-    param_groups = filter(lambda p: p.requires_grad, model.parameters())
+    encoder_params = []
+    rest_params = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if 'encoder' in name:
+            encoder_params.append(param)
+        else:
+            rest_params.append(param)
+
+    param_groups = [{'params': encoder_params, 'lr': lr / 10.},
+                    {'params': rest_params, 'lr': lr}]
 
     # XXX: Warmup is not configured here because it needs to be manually done in optimizer_step()
     logger.debug(f'Constructing {optimizer} optimizer (lr: {lr}, momentum: {momentum})')
@@ -298,7 +304,7 @@ def _configure_optimizer_and_lr_scheduler(hparams, model, loss_tracking_mode='mi
                     'interval': 'step'}
     elif schedule == 'cosine':
         lr_sched = {'scheduler': lr_scheduler.CosineAnnealingLR(optim,
-                                                                cos_t_max,
+                                                                cos_max,
                                                                 cos_min_lr,
                                                                 last_epoch=completed_epochs-1),
                     'interval': 'step'}
@@ -308,8 +314,8 @@ def _configure_optimizer_and_lr_scheduler(hparams, model, loss_tracking_mode='mi
     elif schedule == 'reduceonplateau':
         lr_sched = {'scheduler': lr_scheduler.ReduceLROnPlateau(optim,
                                                                 mode=loss_tracking_mode,
-                                                                factor=rop_factor,
-                                                                patience=rop_patience),
+                                                                factor=sched_factor,
+                                                                patience=sched_patience),
                     'interval': 'step'}
     elif schedule != 'constant':
         raise ValueError(f'Unsupported learning rate scheduler {schedule}.')
