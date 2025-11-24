@@ -26,7 +26,7 @@ The current compilation code determines the language on a page level by traversi
 
 To fine-tune the pretrained base model dataset files in listed in manifest files on all available GPUs:
 
-        $ party train --workers 32 --load 10.5281/zenodo.15764161 -t train.lst -e val.lst
+        $ party --workers 32 train --load 10.5281/zenodo.15764161 -t train.lst -e val.lst
 
 With the default parameters both baseline and bounding box prompts are randomly sampled from the training data. It is suggested that you fine-tune the model with uni-modal line embeddings by only selecting the line format that your segmentation method produces, i.e.:
 
