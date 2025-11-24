@@ -75,8 +75,9 @@ def convert(ctx, output, model_card, checkpoint_path):
               help='Ground truth normalization')
 @click.option('-n', '--normalize-whitespace/--no-normalize-whitespace',
               help='Normalizes unicode whitespace')
+@click.option('--language', default=None, help='Provide the language identifier explicitly. Check list in party/tokenizer.py')
 @click.argument('ground_truth', nargs=-1, type=click.Path(exists=True, dir_okay=False))
-def compile(ctx, output, files, normalization, normalize_whitespace,
+def compile(ctx, output, files, normalization, normalize_whitespace, language,
             ground_truth):
     """
     Precompiles a binary dataset from a collection of XML files.
@@ -106,6 +107,7 @@ def compile(ctx, output, files, normalization, normalize_whitespace,
 
         dataset.compile(ground_truth,
                         output,
+                        language=language,
                         normalization=normalization,
                         normalize_whitespace=normalize_whitespace,
                         callback=_update_bar)
