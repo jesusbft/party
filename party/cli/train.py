@@ -220,7 +220,7 @@ def train(ctx, **kwargs):
     if sum(map(bool, [resume, load, train_from_scratch])) > 1:
         raise click.BadOptionsUsage('load', 'load/resume/train_from_scratch options are mutually exclusive.')
     elif resume is None and load is None and train_from_scratch is False:
-        load = '10.5281/zenodo.15075344'
+        load = '10.5281/zenodo.15764161'
 
     if params.get('augment'):
         try:
